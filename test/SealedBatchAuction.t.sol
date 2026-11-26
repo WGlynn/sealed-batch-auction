@@ -83,7 +83,7 @@ contract SealedBatchAuctionTest is Test {
     uint256 constant DEPOSIT = 0.01 ether;
     uint64 constant C = 5;
     uint64 constant R = 3;
-    uint64 constant W = 10; // settle window
+    uint64 constant W = 40; // settle window (at least MIN_SETTLE_BLOCKS)
 
     SealedBatchAuction venue;
     MockERC20 base;
@@ -410,11 +410,10 @@ contract SealedBatchAuctionTest is Test {
         _toReveal(0);
         venue.reveal(0, _trader(1), s, "a");
         venue.reveal(0, _trader(2), b, "b");
-        _toSettle(0);
-        vm.expectRevert(SealedBatchAuction.NotClaimable.selector);
-        venue.claim(0, ia); // escrow waits for settlement while the batch can still settle
         (,, uint64 se,) = venue.schedule(0);
-        vm.roll(se + 1); // nobody settled in time
+        vm.roll(se + 1); // nobody settled or claimed during the whole settle window
+        vm.expectRevert(SealedBatchAuction.WrongPhase.selector);
+        venue.settle(0);
         venue.claim(0, ia);
         venue.claim(0, ib);
         assertEq(base.balanceOf(_trader(1)), 10 ether);
@@ -670,10 +669,215 @@ contract SealedBatchAuctionTest is Test {
         assertGe(cleared, 15);
     }
 
-    function test_supportsInterface() public view {
+    // ============ Review round 2 ============
+
+    function test_claimSettlesAnUnsettledBatch() public {
+        LimitOrder memory s = _sell(10 ether, S);
+        LimitOrder memory b = _buy(20 ether, 2 * S);
+        bytes32 ia = _commit(_trader(1), s, "a");
+        _commit(_trader(2), b, "b");
+        _toReveal(0);
+        venue.reveal(0, _trader(1), s, "a");
+        venue.reveal(0, _trader(2), b, "b");
+        _toSettle(0);
+        venue.claim(0, ia); // nobody called settle; the claim does it
+        (, bool settled, uint256 p) = venue.batches(0);
+        assertTrue(settled);
+        assertEq(p, 1.5e18);
+        assertEq(quote.balanceOf(_trader(1)), 15 ether);
+    }
+
+    function test_marketLimitIsClampedNotForfeited() public {
+        LimitOrder memory s = _sell(10 ether, S);
+        LimitOrder memory mkt = _buy(20 ether, type(uint256).max); // any price
+        _commit(_trader(1), s, "a");
+        bytes32 ib = _commit(_trader(2), mkt, "b");
+        _toReveal(0);
+        venue.reveal(0, _trader(1), s, "a");
+        venue.reveal(0, _trader(2), mkt, "b");
+        (,, SealedBatchAuction.Status st,,,) = venue.commitmentInfo(ib);
+        assertEq(uint8(st), uint8(SealedBatchAuction.Status.Revealed));
+        _toSettle(0);
+        venue.settle(0);
+        (,, uint256 p) = venue.batches(0);
+        assertGt(p, 0);
+    }
+
+    function test_eventsAreEmitted() public {
+        LimitOrder memory s = _sell(10 ether, S);
+        LimitOrder memory b = _buy(20 ether, 2 * S);
+        bytes32 ia = venue.commitmentOf(0, _trader(1), s, "a");
+        base.mint(_trader(1), 10 ether);
+        vm.prank(_trader(1));
+        base.approve(address(venue), type(uint256).max);
+        vm.deal(_trader(1), DEPOSIT);
+        vm.expectEmit(address(venue));
+        emit IERCSealedBatchAuction.Committed(0, _trader(1), ia, DEPOSIT);
+        vm.prank(_trader(1));
+        venue.commit{value: DEPOSIT}(ia);
+        _commit(_trader(2), b, "b");
+        bytes32 ic = _commit(_trader(3), _sell(1 ether, S), "c"); // never opened
+        _toReveal(0);
+        vm.expectEmit(address(venue));
+        emit IERCSealedBatchAuction.Revealed(0, _trader(1), ia, s);
+        venue.reveal(0, _trader(1), s, "a");
+        venue.reveal(0, _trader(2), b, "b");
+        _toSettle(0);
+        vm.expectEmit(address(venue));
+        emit IERCSealedBatchAuction.BatchCleared(0, address(base), address(quote), 1.5e18, 10 ether, 15 ether);
+        venue.settle(0);
+        vm.expectEmit(address(venue));
+        emit IERCSealedBatchAuction.Forfeited(0, ic, DEPOSIT / 2, DEPOSIT / 2);
+        venue.claim(0, ic);
+    }
+
+    /// Rule 3's bounds with the largest scale: 64 orders near 2^111 units and limits near 2^127 settle without
+    /// overflow, and every unit is accounted for.
+    function test_boundsAtLargestScale() public {
+        SealedBatchAuction v = new SealedBatchAuction(
+            SealedBatchAuction.Config({
+                tokenA: address(base),
+                tokenB: address(quote),
+                commitBlocks: C,
+                revealBlocks: R,
+                settleBlocks: W,
+                deposit: DEPOSIT,
+                forfeitBps: 5000,
+                maxCommits: 64,
+                priceScale: 1e36,
+                tieToleranceBps: 10,
+                minA: 1,
+                minB: 1,
+                sink: sink
+            })
+        );
+        uint256 big = 2 ** 111;
+        uint256 lim = 2 ** 127;
+        bytes32[] memory ids = new bytes32[](64);
+        LimitOrder[] memory os = new LimitOrder[](64);
+        for (uint256 i = 0; i < 64; i++) {
+            os[i] = i % 2 == 0 ? _sell(big - i, lim - (64 - i) * 1e30) : _buy(big - i, lim - i * 1e30);
+            ids[i] = _commitOn(v, _trader(i), os[i], bytes32(i));
+        }
+        vm.roll(_commitEnd(v, 0) + 1);
+        for (uint256 i = 0; i < 64; i++) {
+            v.reveal(0, _trader(i), os[i], bytes32(i));
+        }
+        vm.roll(_revealEnd(v, 0) + 1);
+        v.settle(0);
+        (,, uint256 p) = v.batches(0);
+        assertGt(p, 0);
+        for (uint256 i = 0; i < 64; i++) {
+            v.claim(0, ids[i]);
+        }
+        v.flushSink(address(base));
+        v.flushSink(address(quote));
+        assertEq(base.balanceOf(address(v)), 0);
+        assertEq(quote.balanceOf(address(v)), 0);
+    }
+
+    /// Independent model of rule 14: the exact clearing price, or 0 when the pair does not trade.
+    function _modelPrice(LimitOrder[] memory os, bool[] memory opened, uint16 tol) internal view returns (uint256) {
+        uint256 vmax;
+        for (uint256 i = 0; i < os.length; i++) {
+            if (!opened[i]) continue;
+            uint256 v = _volumeOpened(os, opened, os[i].limitPrice);
+            if (v > vmax) vmax = v;
+        }
+        if (vmax == 0) return 0;
+        uint256 threshold = vmax - vmax * tol / 10_000;
+        uint256 lo = type(uint256).max;
+        uint256 hi;
+        for (uint256 i = 0; i < os.length; i++) {
+            if (!opened[i]) continue;
+            uint256 p = os[i].limitPrice;
+            if (_volumeOpened(os, opened, p) >= threshold) {
+                if (p < lo) lo = p;
+                if (p > hi) hi = p;
+            }
+        }
+        uint256 ps = (lo + hi) / 2;
+        // rule 18: no trade if either side's total would be zero
+        (uint256 s, uint256 q) = _sidesOpened(os, opened, ps);
+        uint256 d = q * S / ps;
+        uint256 vol = s < d ? s : d;
+        uint256 baseT = s > vol ? vol : s;
+        uint256 quoteT = s > vol ? q : (d > vol ? vol * ps / S : q);
+        return (baseT == 0 || quoteT == 0) ? 0 : ps;
+    }
+
+    function _sidesOpened(LimitOrder[] memory os, bool[] memory opened, uint256 p)
+        internal
+        view
+        returns (uint256 s, uint256 q)
+    {
+        for (uint256 i = 0; i < os.length; i++) {
+            if (!opened[i]) continue;
+            if (os[i].sellToken == address(base)) {
+                if (os[i].limitPrice <= p) s += os[i].sellAmount;
+            } else if (os[i].limitPrice >= p) {
+                q += os[i].sellAmount;
+            }
+        }
+    }
+
+    function _volumeOpened(LimitOrder[] memory os, bool[] memory opened, uint256 p) internal view returns (uint256) {
+        (uint256 s, uint256 q) = _sidesOpened(os, opened, p);
+        uint256 d = q * S / p;
+        return s < d ? s : d;
+    }
+
+    /// Random batches with some commitments left unopened: the exact rule-14 price from the independent model,
+    /// and conservation of every token and every wei of deposit, forfeits included.
+    function testFuzz_exactPriceAndForfeits(uint8 nOrders, uint256 seed, bool exact) public {
+        uint16 tol = exact ? 0 : 10;
+        SealedBatchAuction v = _venue(tol, 1, 32);
+        uint256 n = bound(nOrders, 2, 12);
+        LimitOrder[] memory os = new LimitOrder[](n);
+        bool[] memory opened = new bool[](n);
+        bytes32[] memory ids = new bytes32[](n);
+        for (uint256 i = 0; i < n; i++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            os[i] = (r >> 200) % 2 == 0
+                ? _sell(bound(r, 1e9, 1e24), bound(r >> 96, 0.25e18, 4e18))
+                : _buy(bound(r, 1e9, 1e24), bound(r >> 96, 0.25e18, 4e18));
+            opened[i] = (r >> 210) % 5 != 0; // about one in five never opened
+            ids[i] = _commitOn(v, _trader(i), os[i], bytes32(i));
+        }
+        vm.roll(_commitEnd(v, 0) + 1);
+        for (uint256 i = 0; i < n; i++) {
+            if (opened[i]) v.reveal(0, _trader(i), os[i], bytes32(i));
+        }
+        vm.roll(_revealEnd(v, 0) + 1);
+        v.settle(0);
+        (,, uint256 p) = v.batches(0);
+        assertEq(p, _modelPrice(os, opened, tol), "price differs from the rule-14 model");
+
+        uint256 ethBefore;
+        for (uint256 i = 0; i < n; i++) {
+            ethBefore += _trader(i).balance;
+        }
+        for (uint256 i = 0; i < n; i++) {
+            v.claim(0, ids[i]);
+        }
+        v.flushSink(address(0));
+        v.flushSink(address(base));
+        v.flushSink(address(quote));
+        assertEq(address(v).balance, 0);
+        assertEq(base.balanceOf(address(v)), 0);
+        assertEq(quote.balanceOf(address(v)), 0);
+        uint256 ethAfter;
+        for (uint256 i = 0; i < n; i++) {
+            ethAfter += _trader(i).balance;
+        }
+        assertEq(ethAfter + sink.balance, ethBefore + n * DEPOSIT, "deposits not conserved");
+    }
+
+    function test_supportsInterface() public {
         assertTrue(venue.supportsInterface(type(IERCSealedBatchAuction).interfaceId));
         assertTrue(venue.supportsInterface(0xf14fcbc8)); // ERC-5732 IERC_COMMIT_CORE
         assertTrue(venue.supportsInterface(0x01ffc9a7)); // ERC-165
         assertFalse(venue.supportsInterface(0xdeadbeef));
+        emit log_named_bytes32("interface id", bytes32(type(IERCSealedBatchAuction).interfaceId));
     }
 }

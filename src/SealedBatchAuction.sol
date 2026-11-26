@@ -21,6 +21,9 @@ contract SealedBatchAuction is IERCSealedBatchAuction {
     uint256 public constant MAX_SELL_AMOUNT = 2 ** 112; // exclusive
     uint256 public constant MAX_LIMIT_PRICE = 2 ** 128; // exclusive
     uint32 public constant MAX_COMMITS_LIMIT = 64;
+    /// One Ethereum epoch: a settle window this long spans many block producers, so no single producer can let a
+    /// batch expire by leaving it unsettled. A day of blocks is the recommended setting.
+    uint64 public constant MIN_SETTLE_BLOCKS = 32;
 
     bytes32 public constant TYPEHASH = keccak256(
         "SealedBatchOrder(uint256 chainId,address venue,uint256 batchId,address committer,LimitOrder order,bytes32 salt)"
@@ -126,7 +129,7 @@ contract SealedBatchAuction is IERCSealedBatchAuction {
 
     constructor(Config memory cfg) {
         require(cfg.tokenA != cfg.tokenB && cfg.tokenA != address(0) && cfg.tokenB != address(0), "pair");
-        require(cfg.commitBlocks > 0 && cfg.revealBlocks >= 2 && cfg.settleBlocks > 0, "windows");
+        require(cfg.commitBlocks > 0 && cfg.revealBlocks >= 2 && cfg.settleBlocks >= MIN_SETTLE_BLOCKS, "windows");
         require(cfg.forfeitBps <= 10_000 && cfg.tieToleranceBps < 10_000, "bps");
         require(cfg.maxCommits > 0 && cfg.maxCommits <= MAX_COMMITS_LIMIT, "cap");
         require(cfg.priceScale > 0 && cfg.priceScale <= 1e36, "scale");
@@ -248,6 +251,8 @@ contract SealedBatchAuction is IERCSealedBatchAuction {
         if (c.committer != committer) revert NotCommitter();
 
         c.order = order;
+        // A limit at or above the bound means "any price"; clamp it rather than reject a market order.
+        if (order.limitPrice >= MAX_LIMIT_PRICE) c.order.limitPrice = MAX_LIMIT_PRICE - 1;
         if (!_tradable(order)) {
             // The venue's pairs, minimums and bounds are public, so an order that cannot trade is the committer's
             // error. It forfeits like an unopened commitment; otherwise the commitment cap could be filled for free.
@@ -267,7 +272,7 @@ contract SealedBatchAuction is IERCSealedBatchAuction {
     function _tradable(LimitOrder calldata o) internal view returns (bool) {
         bool pair = (o.sellToken == base && o.buyToken == quote) || (o.sellToken == quote && o.buyToken == base);
         return pair && o.sellAmount > 0 && o.sellAmount >= minSellAmount(o.sellToken)
-            && o.sellAmount < MAX_SELL_AMOUNT && o.limitPrice > 0 && o.limitPrice < MAX_LIMIT_PRICE;
+            && o.sellAmount < MAX_SELL_AMOUNT && o.limitPrice > 0;
     }
 
     // ============ Settle ============
@@ -285,6 +290,10 @@ contract SealedBatchAuction is IERCSealedBatchAuction {
         (,,, Phase phase) = schedule(batchId);
         if (phase == Phase.Settled) revert AlreadySettled();
         if (phase != Phase.Settling) revert WrongPhase();
+        _settle(batchId);
+    }
+
+    function _settle(uint256 batchId) internal {
         Batch storage b = batches[batchId];
         b.settled = true;
 
@@ -488,13 +497,16 @@ contract SealedBatchAuction is IERCSealedBatchAuction {
 
     /// @notice Pay a commitment's proceeds, unfilled remainder and deposit (less any forfeit) to its committer.
     ///         Callable by anyone once the batch's reveal window has closed; money only ever goes to the committer.
-    ///         An escrowed order waits for settlement, or for the batch to expire, which returns it in full.
+    ///         Claiming an escrowed order in an unsettled batch settles the batch first; after the settle window,
+    ///         an unsettled batch has expired and its escrow returns in full.
     function claim(uint256 batchId, bytes32 commitment) external nonReentrant {
         Commitment storage c = _commitments[commitment];
         if (c.status == Status.None || c.batchId != batchId || c.claimed) revert NotClaimable();
         (,,, Phase phase) = schedule(batchId);
         if (phase == Phase.Commit || phase == Phase.Reveal) revert NotClaimable();
-        if (c.status == Status.Revealed && phase == Phase.Settling) revert NotClaimable();
+        // The first claim on an escrowed order settles the batch if nobody has yet, so a trader never has to wait
+        // for, or depend on, a separate settle transaction.
+        if (c.status == Status.Revealed && phase == Phase.Settling) _settle(batchId);
         c.claimed = true;
 
         address to = c.committer;

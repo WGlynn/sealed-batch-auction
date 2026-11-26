@@ -1,12 +1,19 @@
-# Sealed-Bid Batch Auction: reference implementation
+# sealed-batch-auction
 
-Reference implementation and tests for a draft ERC (not yet filed): commit-reveal batch auctions that settle
-every filled order at one uniform clearing price.
+Reference implementation for a draft ERC, Sealed-Bid Batch Auction. Traders commit order hashes, the orders are
+revealed together, and anyone can settle the batch, which clears each token pair at one price.
 
-- `src/IERCSealedBatchAuction.sol`: the interface.
-- `src/SealedBatchAuction.sol`: one token pair per venue, written for clarity, not gas (settlement is O(n^2);
-  about 6.7M gas at the 64-order cap in `test_settleAtCapFitsTheTransactionGasCap`, under the 2^24 per-transaction cap of EIP-7825). Not audited.
-- `test/SealedBatchAuction.t.sol`: 28 unit tests and a fuzz test of the settlement properties (conservation,
-  uniform price, limits, volume maximality against an independent model, bounded rounding dust).
+The draft is not filed yet.
 
-Run the tests with Foundry, scoped to the test file: `--match-path test/SealedBatchAuction.t.sol -vv`. CC0.
+- `src/IERCSealedBatchAuction.sol` is the interface.
+- `src/SealedBatchAuction.sol` handles one token pair per venue. Settlement is O(n^2) in the orders of a batch,
+  about 6.7M gas at the 64-order cap. Not audited.
+- `test/SealedBatchAuction.t.sol` has 33 tests, including fuzz tests of token and deposit conservation, the
+  clearing price against an independent model, limits, and rounding.
+
+Known open problem: reveals are public as they land, so the last one to reveal can move the clearing price within
+the spread.
+
+Tests: `forge test --match-path test/SealedBatchAuction.t.sol`
+
+CC0.

@@ -489,8 +489,7 @@ contract SealedBatchAuctionTest is Test {
         (,, uint256 p) = venue.batches(0);
         // Without tolerance the dust order would set the price to 1.99; the limits within 10 bps of the maximum
         // volume still span [1.0, 2.0], so the price stays close to the midpoint.
-        assertGe(p, 1.49e18);
-        assertLe(p, 1.51e18);
+        assertEq(p, 1.5e18); // the vector in the spec's Test Cases
     }
 
     function test_withoutToleranceDustSetsThePrice() public {

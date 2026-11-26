@@ -16,4 +16,8 @@ the spread.
 
 Tests: `forge test --match-path test/SealedBatchAuction.t.sol`
 
+Built with AI. Will Glynn set the direction and made the calls; Jarvis, a research agent built on Claude Opus 5.5
+(Anthropic) running in Claude Code, did most of the prior-art search, the spec text, this implementation and its
+tests, and two rounds of adversarial review by separate Claude Opus 5.5 agents. Will reviewed and approved it.
+
 CC0.
